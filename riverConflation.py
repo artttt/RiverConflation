@@ -135,6 +135,11 @@ def network_copy_offset(DG,distance=0.0):
 # TODO: work out the rtree bulk loading method - its quicker apparently
 def build_index(DG):
     '''build spatial and other indexes'''
+    
+    index_generator = ((0, data['subCatch'].bounds,(f,t,k)) for f,t,k,data in DG.edges_iter(data=True,keys=True) if not data['subCatch'].is_empty)
+    return index.Index(index_generator)
+
+def build_index_slow(DG):
     DG_idx = index.Index()
     for f,t,k,data in DG.edges_iter(data=True,keys=True):
         if not data['subCatch'].is_empty:
@@ -144,11 +149,8 @@ def build_index(DG):
 
 # In[ ]:
 
-# Need this for both networks
-#for DG1 these could be chained together as the outer loop of find_all_matches to avoid keeping and of this intermediate data
-#big saving on memory footprint possible for large DG1 networks.
-def upstream_edge_set(DG):
-    '''build up a list of upstream edge ids in the destination network
+def upstream_edge_set_old_method(DG):
+    '''build up a list of upstream edge ids as an attribute in the network
     
     WARNING: these can have a large memory footprint'''
     ts = nx.topological_sort(DG)
@@ -159,6 +161,35 @@ def upstream_edge_set(DG):
         for f,t,k,data in DG.out_edges_iter(n,data=True,keys=True):
             data['ids'] = new_set.union([(f,t,k)])
 
+def upstream_edge_set(DG):
+    '''build up a list of upstream edge ids as an attribute in the network
+    
+    WARNING: these can have a large memory footprint'''
+    for e,ids in upstream_edge_set_iter(DG):
+        DG.get_edge_data(*e)['ids'] = ids
+            
+def upstream_edge_set_iter(DG):
+    '''build up a list of upstream edge ids in the network
+    
+    returns ((f,t,k),ids)
+    where (f,t,k) identifies the edge
+    and ids is a set of edge identifiers in the the same style.
+    
+    avoids the large memory footprint of storing these
+    and is more efficent then generating them at random for edges
+    because it uses the network topology to avoid multiple network traversals.'''
+    temp_dict = {}
+    ts = nx.topological_sort(DG)
+    for n in ts:
+        new_set = set()
+        for f,t,k,data in DG.in_edges_iter(n,data=True,keys=True):
+            new_set.update(temp_dict[(f,t,k)])
+            del temp_dict[(f,t,k)]
+        for f,t,k,data in DG.out_edges_iter(n,data=True,keys=True):
+            ids = new_set.union([(f,t,k)])
+            temp_dict[(f,t,k)] = ids
+            yield ((f,t,k),ids)
+            
 def node_upstream_edge_set(DG):
     '''build up a list of upstream edge ids in the destination network
     
@@ -186,26 +217,37 @@ def upstream_node_set(DG):
 # In[ ]:
 
 def sub_catch_area(DG):
-    '''calc catchment area
-    
-    works with anabranching networks without double counting'''
+    '''calc subcatchment area'''
     for f,t,k,data in DG.edges_iter(data=True,keys=True):
         data['area'] = data['subCatch'].area
         
-def catch_area_slow(DG):
+def catch_area_needs_ids(DG):
     '''calc catchment area
     
     works with anabranching networks without double counting'''
+    sub_catch_area(DG)
     for f,t,k,data in DG.edges_iter(data=True,keys=True):
         data['catchArea'] = sum(DG.get_edge_data(*e)['area'] for e in data['ids'])
-
-def node_catch_area(DG):
+        
+def catch_area_no_ids(DG):
     '''calc catchment area
+    
+    a simpiler but slower variation on catch_area
+    doesnt need ids precomputed
+    works with anabranching networks without double counting'''
+    sub_catch_area(DG)
+    for e,ids in upstream_edge_set_iter(DG):
+        DG.get_edge_data(*e)['catchArea'] = sum(DG.get_edge_data(*e2)['area'] for e2 in ids)
+        
+def node_catch_area(DG):
+    '''calc catchment area to nodes
     
     works with anabranching networks without double counting'''
     for n in DG:
         DG.node[n]['catchArea'] = sum(DG.get_edge_data(*e)['area'] for e in DG.node[n]['ids'])
-        
+
+
+
 def catch_area(DG):
     '''calc catchment area
     
@@ -214,16 +256,19 @@ def catch_area(DG):
     # about 3 times faster than other area calculations
     #although a bit more complex to understand the code
     #doesnt need 'ids' from upstream_edge_set
+    temp_dict = {}
     ts = nx.topological_sort(DG)
     for n in ts:
         new_set = set()
         for f,t,k,data in DG.in_edges_iter(n,data=True,keys=True):
-            new_set.update((data['xxx_temp']))
-            del data['xxx_temp']
+            new_set.update(temp_dict[(f,t,k)])
+            del temp_dict[(f,t,k)]
             DG.node[n]['catchArea'] = sum(a for a,f,t,k in new_set)
         for f,t,k,data in DG.out_edges_iter(n,data=True,keys=True):
-            data['xxx_temp'] = new_set.union([(data['subCatch'].area,f,t,k)])
-            data['catchArea'] = sum(a for a,f,t,k in data['xxx_temp'])
+            e_set = new_set.union([(data['subCatch'].area,f,t,k)])
+            temp_dict[(f,t,k)] = e_set
+            data['catchArea'] = sum(a for a,f,t,k in e_set)
+            
 
 
 # In[ ]:
@@ -270,25 +315,34 @@ def full_overlaps(DG,edges):
     return fullOverlaps
 
 
+# If speed or memory usage is a problem then there are a few changes that could be implemented
+# 
+# The first speed up might be to split DG1 up into seperate basins if possible. These could be run in parallel without any code changes.
+# 
+# While find all matches trys to be very efficent in a large network if you are only interested in a few catchment then you could write a similar routine that only ran for those catchments to save some time.
+# 
+# The 2 slow points are build_overlaps and find_all_matches (including full_overlaps).
+# - could look at using cython for these. Although in build_overlaps the 85% of the time is spent in shapely/geos doing intersections
+# - The next speed step is that both build_overlaps and find_all_matches could be easily implemented in parallel. would be best to prune the memory foot print of the required objects before copying for other processes (or use shared mem).
+# - One memory saving is that there is no need to keep the spatial features in memory after build_overlaps is finished (need to extract node locations from streams in DG1 for find_matches).
+# 
+
 # In[ ]:
 
 def find_all_matches(DG1,DG2,DG2_idx,searchRadius,sizeRatio=0,maxMatchKeep=1):
     '''for each catchment in DG1 find list the best matches
-    
-    This is a fairly efficent way of doing this.
-    In a large network if you are only interested in a few catchment
-    then you could write a similar routine that only ran for those catchments to save some time.
-    
+
     see find_matches for more info
     '''
     matches = {}
-    for e in DG1.edges_iter(keys=True):
-        m = find_matches(e,DG1,DG2,DG2_idx,searchRadius,sizeRatio,maxMatchKeep)
+    #build ids on the fly with the iterator to save a lot of memory
+    for e,eids in upstream_edge_set_iter(DG1):
+        m = find_matches(e,eids,DG1,DG2,DG2_idx,searchRadius,sizeRatio,maxMatchKeep)
         if m:
             matches[e] = m
     return matches
 
-def find_matches(e,DG1,DG2,DG2_idx,searchRadius,sizeRatio=0,maxMatchKeep=1):
+def find_matches(e,eids,DG1,DG2,DG2_idx,searchRadius,sizeRatio=0,maxMatchKeep=1):
     '''for a catchment in DG1 find list the best matches
 
     searchRadius
@@ -308,7 +362,7 @@ def find_matches(e,DG1,DG2,DG2_idx,searchRadius,sizeRatio=0,maxMatchKeep=1):
     '''
     data = DG1.get_edge_data(*e)
     # remember dont keep fullOverlaps - they use a lot of RAM
-    fullOverlaps = full_overlaps(DG1,data['ids'])
+    fullOverlaps = full_overlaps(DG1,eids)
     if len(fullOverlaps) == 0:
         # not going to find anything so move on and save nothing
         return
@@ -415,13 +469,11 @@ def write_debug_lines(DG1,DG2,best,fileName):
 #one way of doing this is done with find_all_node_matches.
 #The way being tested here is to use the existing list of good conflations to look at all inflowing catchments
 #to a confluence together and pick the best one.
-#each catchment is given equal weighting (not area weighted!!) - not sure that is a good idea
-def confluence_matches():
-    print 'not operational as yet'
-    return #not operational as yet
-
-
-
+#each catchment is given equal weighting (not area weighted!!)
+#seems to work quite well.
+def confluence_matches(DG1,matches):
+    #TODO: tidy up this code
+    node_matches = []
     for n in DG1.nodes_iter():
         in_matches = []
         for f,t,k,data in DG1.in_edges_iter(n,data=True,keys=True):
@@ -447,11 +499,32 @@ def confluence_matches():
                     n_dict[n2].append (max(ll))
 
             s = sum(qual for qual,overlap,e in n_dict[n2])
-            nScore.append((s/len(in_matches),n2))
+            nScore.append((s/len(in_matches),n,n2))
 
         #print n_dict[max(nScore)[1]]
-        print max(nScore),n
+        node_matches.append(max(nScore))
+        #print max(nScore),n
+    return node_matches
 
+def write_debug_lines_confluence_matches(DG1,DG2,node_matches,fileName):
+    '''a simple output to show how each to node matches up
+    
+    handy for looking for errors in the conflation'''
+    schema = {
+        'geometry': 'LineString',
+        'properties': {'qual': 'float'},
+    }
+    with fiona.open(fileName, 'w', 'ESRI Shapefile', schema) as c:
+        for qual,n1,n2 in node_matches:
+            for f,t,k,data in DG1.in_edges(n1,data=True,keys=True)[0:1]:
+                p1 = data['stream'].coords[-1]
+            for f,t,k,data in DG2.in_edges(n2,data=True,keys=True)[0:1]:
+                p2 = data['stream'].coords[-1]
+            geom = LineString(LineString([p1, p2]))
+            c.write({
+                'geometry': mapping(geom),
+                'properties': {'qual': qual},
+            })
 
 
 # In[ ]:
